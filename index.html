@@ -1,0 +1,959 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>T-Rex Runner 3D</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; background: #000; }
+  body {
+    overflow: hidden; color: #cfcfcf;
+    font: 13px/1.5 ui-monospace, "Cascadia Mono", Menlo, monospace;
+  }
+  #scene { position: fixed; inset: 0; display: block; }
+
+  #hud {
+    position: fixed; inset: 0; pointer-events: none;
+    display: grid; grid-template-rows: auto 1fr auto; padding: 18px 22px;
+  }
+  #score {
+    justify-self: end; display: flex; gap: 22px; align-items: baseline;
+    font-size: 26px; letter-spacing: 2px; text-shadow: 0 0 12px #000;
+  }
+  #score .hi { opacity: .55; font-size: 16px; letter-spacing: 1px; }
+  #score .val { font-variant-numeric: tabular-nums; }
+
+  #msg {
+    place-self: center; text-align: center; font-size: 15px; line-height: 2;
+    letter-spacing: 3px; text-transform: uppercase; opacity: 0;
+    transition: opacity .25s ease; text-shadow: 0 0 16px #000;
+  }
+  #msg.show { opacity: .92; }
+
+  #foot {
+    justify-self: start; font-size: 11px; letter-spacing: .5px; opacity: .38;
+  }
+  #foot b { font-weight: 500; color: #eee; opacity: .9; }
+  #toast {
+    position: fixed; left: 50%; bottom: 42px; transform: translateX(-50%);
+    font-size: 11px; letter-spacing: 2px; text-transform: uppercase;
+    opacity: 0; transition: opacity .3s ease; pointer-events: none;
+  }
+  #toast.show { opacity: .7; }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+
+<div id="hud">
+  <div id="score">
+    <span class="hi">HI <span class="val" id="hi">0</span></span>
+    <span class="val" id="dist">0</span>
+  </div>
+
+  <div id="msg"></div>
+
+  <div id="foot">
+    <b>SPACE</b> jump &nbsp; <b>&darr;</b> duck &nbsp; <b>P</b> pause &nbsp;
+    <b>M</b> mute &nbsp; <b>ENTER</b> restart
+  </div>
+</div>
+<div id="toast"></div>
+
+<script src="three.min.js"></script>
+<script>
+'use strict';
+/* T-Rex Runner 3D
+   ------------------------------------------------------------------
+   The simulation is a faithful port of Chromium's
+   components/neterror/resources/dino_game/ (see README). It still runs in
+   the original 600x150 pixel coordinate space; only the presentation is 3D.
+   Screen x maps to world z, screen y maps to world y, so every collision
+   box, sprite offset and tuning constant keeps its original meaning.
+
+   UNIT CONVENTION (cannot be "fixed" in isolation):
+     obstacles scroll by Math.floor(speed * FPS / 1000 * deltaTime)
+   The speed value is px/frame at 60fps already, so maxSpeed 13 is ~13px a
+   frame, not 13*1.25. distanceRan uses speed * dt / msPerFrame.
+   ------------------------------------------------------------------ */
+
+// ============================================================ dimensions
+const WIDTH = 600, HEIGHT = 150, BOTTOM_PAD = 10;
+// trex.ts groundYPos = height - trexHeight - bottomPad. It is the TOP edge,
+// so the feet overlap the horizon exactly as in Chrome.
+const GROUND_Y = HEIGHT - 47 - BOTTOM_PAD;   // 93
+const FEET_SCREEN_Y = GROUND_Y + 47;         // 140, the world ground plane
+
+// ============================================================ config
+const CFG = {
+  acceleration: 0.001,
+  bgCloudSpeed: 0.2,
+  cloudFrequency: 0.5,
+  gapCoefficient: 0.6,
+  initialJumpVelocity: -10,   // trex.ts normalJumpConfig
+  minJumpHeight: 30,
+  gravity: 0.6,
+  dropVelocity: -5,
+  speedDropCoefficient: 3,
+  maxSpeed: 13,
+  maxClouds: 6,
+  maxObstacleLength: 3,
+  speed: 6,
+  clearTime: 3000,
+  invertDistance: 700,
+  maxGapCoefficient: 1.5,
+};
+
+const TREX = {
+  xPos: 50, yPos: GROUND_Y,
+  width: 44, height: 47,
+  widthDuck: 59, heightDuck: 25,
+  groundYPos: GROUND_Y,
+  gravity: CFG.gravity,
+  initialJumpVelocity: CFG.initialJumpVelocity,
+  dropVelocity: CFG.dropVelocity,
+  speedDropCoefficient: CFG.speedDropCoefficient,
+  minJumpHeight: 0, maxJumpHeight: CFG.minJumpHeight,
+  jumpVelocity: 0, speedDrop: false, jumped: false, reachedMinHeight: true,
+  status: 'waiting', timer: 0, currentFrame: 0,
+};
+
+const ANIM = {
+  waiting: { frames: [44, 0],    ms: 1000 / 3 },
+  running: { frames: [88, 132],  ms: 1000 / 12 },
+  crashed: { frames: [220],      ms: 1000 / 60 },
+  jumping: { frames: [0],        ms: 1000 / 60 },
+  ducking: { frames: [264, 323], ms: 1000 / 8 },
+};
+
+const TREX_BOXES = {
+  running: [[22,0,17,16],[1,18,30,9],[10,35,14,8],[1,24,29,5],[5,30,21,4],[9,34,15,4]],
+  ducking: [[1,18,55,25]],
+};
+
+// offline_sprite_definitions.ts, both tables (hdpi is NOT ldpi*2).
+const SPR_LDPI = {
+  tRex: { x: 848, y: 2 }, cactusLarge: { x: 332, y: 2 }, cactusSmall: { x: 228, y: 2 },
+  pterodactyl: { x: 134, y: 2 }, textSprite: { x: 655, y: 2 }, restart: { x: 2, y: 68 },
+  horizon: { x: 2, y: 54 }, backgroundEl: { x: 86, y: 2 },
+};
+const SPR_HDPI = {
+  tRex: { x: 1678, y: 2 }, cactusLarge: { x: 652, y: 2 }, cactusSmall: { x: 446, y: 2 },
+  pterodactyl: { x: 260, y: 2 }, textSprite: { x: 1294, y: 2 }, restart: { x: 2, y: 130 },
+  horizon: { x: 2, y: 104 }, backgroundEl: { x: 166, y: 2 },
+};
+let SPR = SPR_LDPI;
+
+const HORIZON = { w: 600, h: 12, y: 127 };
+
+const OBSTACLES = [
+  { type: 'cactusSmall', width: 17, height: 35, yPos: 105,
+    multipleSpeed: 4, minGap: 120, minSpeed: 0,
+    boxes: [[0,7,5,27],[4,0,6,34],[10,4,7,14]] },
+  { type: 'cactusLarge', width: 25, height: 50, yPos: 90,
+    multipleSpeed: 7, minGap: 120, minSpeed: 0,
+    boxes: [[0,12,7,38],[8,0,7,49],[13,10,10,38]] },
+  { type: 'pterodactyl', width: 46, height: 40, yPos: [100, 75, 50],
+    multipleSpeed: 999, minGap: 150, minSpeed: 8.5, speedOffset: 0.8,
+    numFrames: 2, frameRate: 1000 / 6,
+    boxes: [[15,15,16,5],[18,21,24,6],[2,14,4,3],[6,10,4,7],[10,8,6,9]] },
+];
+
+// ============================================================ game state
+const rnd = (a, b) => Math.floor(Math.random() * (b - a + 1)) + a;
+
+function freshState() {
+  return {
+    activated: false, playing: false, playingIntro: false, crashed: false,
+    paused: false, speed: CFG.speed, distanceRan: 0, runningTime: 0,
+    msPerFrame: 1000 / 60, obstacles: [], clouds: [], cloudTimer: 0,
+    crashAt: 0, flash: 0,
+  };
+}
+let state = freshState();
+let highScore = 0;
+try { highScore = Number(localStorage.getItem('dino3d.high') || 0) || 0; } catch {}
+
+// ============================================================ simulation
+// Verbatim port of trex.ts / horizon.ts / obstacle.ts / offline.ts.
+function setStatus(s) {
+  if (TREX.status === s) return;
+  TREX.status = s;
+  TREX.currentFrame = 0;
+  TREX.timer = 0;
+}
+
+function startJump(speed) {
+  if (TREX.jumped || state.playingIntro) return;
+  TREX.status = 'jumping';
+  TREX.speedDrop = false;
+  TREX.jumped = true;
+  TREX.reachedMinHeight = false;
+  TREX.jumpVelocity = TREX.initialJumpVelocity - (speed / 10);
+  TREX.minJumpHeight = TREX.groundYPos - CFG.minJumpHeight;
+  TREX.currentFrame = 0;
+  TREX.timer = 0;
+  state.playingIntro = true;
+  state.activated = true;
+  state.playing = true;
+  fx.sfx('jump');
+}
+
+function endJump() {
+  if (TREX.reachedMinHeight && TREX.jumpVelocity < TREX.dropVelocity) {
+    TREX.jumpVelocity = TREX.dropVelocity;
+  }
+}
+
+function updateJump(dt) {
+  const framesElapsed = dt / state.msPerFrame;
+  TREX.yPos += Math.round((TREX.speedDrop
+    ? TREX.jumpVelocity * TREX.speedDropCoefficient
+    : TREX.jumpVelocity) * framesElapsed);
+  TREX.jumpVelocity += TREX.gravity * framesElapsed;
+
+  // These three comparisons mean different things and must not be unified:
+  // minJumpHeight is absolute (groundYPos-30), maxJumpHeight stays relative.
+  if (TREX.yPos < TREX.minJumpHeight || TREX.speedDrop) TREX.reachedMinHeight = true;
+  if (TREX.yPos < TREX.maxJumpHeight || TREX.speedDrop) endJump();
+
+  if (TREX.yPos >= TREX.groundYPos) {
+    TREX.yPos = TREX.groundYPos;
+    TREX.speedDrop = false;
+    TREX.jumpVelocity = 0;
+    TREX.jumped = false;
+    TREX.reachedMinHeight = true;
+    if (TREX.status === 'jumping') setStatus('running');
+    fx.dust();
+  }
+}
+
+function updateTrexAnim(dt) {
+  TREX.timer += dt;
+  const a = ANIM[TREX.status];
+  let guard = 0;
+  while (TREX.timer >= a.ms && guard++ < 8) {
+    TREX.currentFrame = (TREX.currentFrame + 1) % a.frames.length;
+    TREX.timer -= a.ms;
+  }
+}
+
+function trexTop() { return TREX.yPos; }
+// The ducking ART is still 47px tall — trex.ts draws it with
+// outputHeight = sourceHeight (47); only the collision box shrinks to 25.
+// Using heightDuck for the sprite crop grabs a 25px sliver of the sheet.
+function trexHeight() { return TREX.height; }
+function trexWidth() { return TREX.status === 'ducking' ? TREX.widthDuck : TREX.width; }
+
+function horizonIncrement(dt) { return Math.floor(state.speed * (60 / 1000) * dt); }
+
+function obstacleGap(type, speed) {
+  const minGap = Math.round(type.width * speed + type.minGap * CFG.gapCoefficient);
+  return Math.round(minGap * CFG.maxGapCoefficient);
+}
+
+function addObstacle(speed) {
+  const eligible = OBSTACLES.filter(t => speed >= t.minSpeed);
+  if (!eligible.length) return;
+  const type = eligible[rnd(0, eligible.length - 1)];
+  const last = state.obstacles[state.obstacles.length - 1];
+  if (last && last.xPos > WIDTH - last.gap) return;
+  const size = rnd(1, Math.min(CFG.maxObstacleLength,
+    Math.floor(speed / type.multipleSpeed) + 1));
+  state.obstacles.push({
+    type, size, xPos: WIDTH,
+    yPos: Array.isArray(type.yPos) ? type.yPos[rnd(0, type.yPos.length - 1)] : type.yPos,
+    gap: obstacleGap(type, speed),
+    width: type.width * size, height: type.height,
+    speedOffset: type.speedOffset || 0,
+    collisionBoxes: type.boxes, currentFrame: 0, timer: 0,
+  });
+}
+
+function updateObstacles(dt) {
+  for (const o of state.obstacles) {
+    const s = state.speed - o.speedOffset * state.speed;
+    o.xPos -= Math.floor((s * 60 / 1000) * dt);
+    if (o.type.numFrames) {
+      o.timer += dt;
+      if (o.timer >= o.type.frameRate) { o.currentFrame ^= 1; o.timer = 0; }
+    }
+  }
+  state.obstacles = state.obstacles.filter(o => o.xPos + o.width > 0);
+  const last = state.obstacles[state.obstacles.length - 1];
+  if (!last || last.xPos < WIDTH - last.gap) addObstacle(state.speed);
+}
+
+function collide(o) {
+  const ducking = TREX.status === 'ducking';
+  const boxes = ducking ? TREX_BOXES.ducking : TREX_BOXES.running;
+  const tx = TREX.xPos, ty = trexTop();
+  for (const [bx, by, bw, bh] of boxes) {
+    for (const [ox, oy, ow, oh] of o.collisionBoxes) {
+      if (tx + bx < o.xPos + ox + ow && tx + bx + bw > o.xPos + ox &&
+          ty + by < o.yPos + oy + oh && ty + by + bh > o.yPos + oy) return true;
+    }
+  }
+  return false;
+}
+
+function update(dt) {
+  if (state.paused || !state.playing) return;
+  if (state.playingIntro) {
+    updateTrexAnim(dt);
+    state.playingIntro = false;
+    return;
+  }
+  const hasObstacles = state.runningTime > CFG.clearTime;
+  state.runningTime += dt;
+
+  if (TREX.status === 'jumping' || TREX.status === 'ducking') updateJump(dt);
+  updateTrexAnim(dt);
+
+  state.cloudTimer += dt;
+  if (state.cloudTimer >= 1000 / CFG.cloudFrequency) {
+    state.cloudTimer = 0;
+    if (state.clouds.length < CFG.maxClouds) {
+      state.clouds.push({ xPos: WIDTH + 46, yPos: rnd(18, 78), z: -6 - Math.random() * 26 });
+    }
+  }
+  for (const c of state.clouds) {
+    c.xPos -= Math.floor((CFG.bgCloudSpeed / 1000) * dt * state.speed);
+  }
+  state.clouds = state.clouds.filter(c => c.xPos + 46 > 0);
+
+  if (hasObstacles) updateObstacles(dt);
+
+  state.distanceRan += state.speed * dt / state.msPerFrame;
+  if (state.speed < CFG.maxSpeed) state.speed += CFG.acceleration;
+
+  if (hasObstacles) {
+    for (const o of state.obstacles) {
+      if (collide(o)) { gameOver(); return; }
+    }
+  }
+}
+
+function gameOver() {
+  state.playing = false;
+  state.crashed = true;
+  state.crashAt = performance.now();
+  setStatus('crashed');
+  if (state.distanceRan > highScore) {
+    highScore = state.distanceRan;
+    try { localStorage.setItem('dino3d.high', String(highScore)); } catch {}
+  }
+  fx.crash();
+  fx.sfx('crash');
+  showMsg('game over &mdash; enter to restart');
+}
+
+function reset() {
+  const hi = highScore;
+  state = freshState();
+  highScore = hi;
+  TREX.yPos = GROUND_Y;
+  TREX.jumpVelocity = 0;
+  TREX.jumped = false;
+  TREX.speedDrop = false;
+  TREX.status = 'waiting';
+  TREX.currentFrame = 0;
+  TREX.timer = 0;
+  hideMsg();
+}
+
+// ============================================================ three.js
+// Game x (0..600, left to right on screen) maps to world z receding into the
+// distance. The T-Rex at x=50 must therefore sit a short way down the track,
+// not at the camera, so the runner reads in the left third with obstacles
+// coming toward the viewer from depth.
+const world = {
+  px: 0.030,            // world units per game pixel
+  zRunner: 1.5,         // world z for game x = 50 (the T-Rex)
+  // Depth the track is compressed into. Far shorter than the original 2D
+  // layout implies, on purpose: a perspective camera shrinks distance
+  // hyperbolically, so stretching x=600 out to z=-50 made a spawn about 2% of
+  // screen height and unreadable. 9.5 units is enough foreshortening to give
+  // the scene depth while keeping an obstacle plainly visible from the instant
+  // it spawns and growing noticeably as it closes on the runner.
+  zSpan: 15,
+};
+const zForX = x => world.zRunner - ((x - 50) / (WIDTH - 50)) * world.zSpan;
+const yForScreen = y => (FEET_SCREEN_Y - y) * world.px;
+const uForPx = v => v * world.px;
+
+let renderer, scene, camera, clock;
+let groundMesh, groundTex, stars, streakMat, dustPts, crashPts;
+let trexMesh, trexShadow, restartMesh;
+const obstacleMeshes = new Map();
+const cloudMeshes = new Map();
+
+// --- textures from the authentic spritesheet -------------------------------
+const sheet = new Image();
+let spriteScale = 1;
+let spriteReady = false;
+
+// After inverting, the page halo is near-black and the art is light grey.
+// Flood-fill dark pixels inward from the crop border and clear them, so the
+// sprite keeps only its artwork. Whites enclosed by ink (the T-Rex eye) are
+// reached only through ink and therefore survive untouched.
+function knockOutDarkHalo(px, w, h) {
+  const d = px.data;
+  const isDark = i => d[i] < 70 && d[i + 1] < 70 && d[i + 2] < 70;
+  const seen = new Uint8Array(w * h);
+  const stack = [];
+  for (let x = 0; x < w; x++) { stack.push(x, 0, x, h - 1); }
+  for (let y = 0; y < h; y++) { stack.push(0, y, w - 1, y); }
+  while (stack.length) {
+    const y = stack.pop(), x = stack.pop();
+    if (x < 0 || y < 0 || x >= w || y >= h) continue;
+    const k = y * w + x;
+    if (seen[k]) continue;
+    seen[k] = 1;
+    const i = k * 4;
+    if (!isDark(i)) continue;
+    d[i + 3] = 0;
+    stack.push(x + 1, y, x - 1, y, x, y + 1, x, y - 1);
+  }
+}
+
+// sx/sy/w/h are LOGICAL (1x) sprite-space values; this scales them to the
+// loaded sheet. Callers must not pre-multiply by spriteScale.
+function cropTexture(sx, sy, w, h) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const g = c.getContext('2d');
+  g.imageSmoothingEnabled = false;
+  g.drawImage(sheet, sx * spriteScale, sy * spriteScale,
+    w * spriteScale, h * spriteScale, 0, 0, w, h);
+  // Chrome draws this sheet on a white page, so every sprite is ink (#535353)
+  // inside an opaque white halo. Inverting — what Chrome's own dark mode does
+  // with a canvas filter — turns the ink light grey and the halo black. The
+  // halo is then cleared to transparent so the sprite can sit on a 3D form
+  // without carrying a black card around with it. Inverting first means the
+  // halo is near-black before the flood fill looks for it.
+  const px = g.getImageData(0, 0, w, h);
+  const d = px.data;
+  for (let i = 0; i < d.length; i += 4) {
+    d[i] = 255 - d[i];
+    d[i + 1] = 255 - d[i + 1];
+    d[i + 2] = 255 - d[i + 2];
+  }
+  knockOutDarkHalo(px, w, h);
+  g.putImageData(px, 0, 0);
+  const t = new THREE.CanvasTexture(c);
+  t.magFilter = THREE.NearestFilter;
+  t.minFilter = THREE.NearestFilter;
+  t.generateMipmaps = false;
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+// --- ground ---------------------------------------------------------------
+function makeGroundTexture() {
+  const c = document.createElement('canvas');
+  c.width = 512; c.height = 128;
+  const g = c.getContext('2d');
+  // Lift the ground off pure black: an obstacle and the runner are both light
+  // ink now, so the track needs to be a visible mid-tone for them to read.
+  const grad = g.createLinearGradient(0, 0, 0, 128);
+  grad.addColorStop(0, '#1b1b1b');
+  grad.addColorStop(1, '#101010');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 512, 128);
+  // Sparse dash marks echoing Chrome's horizon line, kept faint so they do not
+  // compete with the sprites.
+  g.fillStyle = '#4a4a4a';
+  for (let i = 0; i < 26; i++) {
+    const x = Math.random() * 512, w = 2 + Math.random() * 9;
+    g.fillRect(x, 14 + Math.random() * 96, w, 1);
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(10, 1);
+  t.magFilter = THREE.NearestFilter;
+  return t;
+}
+
+function buildScene() {
+  renderer = new THREE.WebGLRenderer({
+    canvas: document.getElementById('scene'), antialias: true,
+  });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setClearColor(0x000000, 1);
+
+  scene = new THREE.Scene();
+  scene.fog = new THREE.FogExp2(0x000000, 0.017);
+
+  // Offset to the left so the T-Rex (game x=50) sits in the left third, with
+  // the obstacle approach visible ahead — same read as the 2D original.
+  // Behind and above the runner, looking down the track.
+  // Behind, above, and offset right of the track centre: the runner sits in
+  // the left third with obstacles receding ahead, and the slight yaw gives the
+  // scene depth instead of a flat head-on view.
+  // Camera sits off the track's centre line so the runner and the obstacles
+  // behind it do not stack on the same screen column; the slight lateral
+  // offset is what makes their depth difference readable.
+  // Slightly right of the runner and aimed between runner and horizon, so the
+  // composition sits centred in the frame instead of hugging the left edge.
+  camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 400);
+  camera.position.set(2.2, 2.45, 6.6);
+  camera.lookAt(0.55, 1.15, -5.5);
+
+  // Lighting: a key light plus a rim, both animated by the day/night cycle.
+  scene.add(new THREE.AmbientLight(0x8899bb, 0.55));
+  const key = new THREE.DirectionalLight(0xffffff, 1.5);
+  key.position.set(-6, 12, 6);
+  scene.add(key);
+  const rim = new THREE.DirectionalLight(0x88aaff, 0.5);
+  rim.position.set(8, 5, -10);
+  scene.add(rim);
+  world.key = key; world.rim = rim;
+
+  // Ground plane.
+  groundTex = makeGroundTexture();
+  const groundGeo = new THREE.PlaneGeometry(90, 110);
+  const groundMat = new THREE.MeshStandardMaterial({
+    map: groundTex, color: 0xffffff, roughness: 1, metalness: 0,
+  });
+  groundMesh = new THREE.Mesh(groundGeo, groundMat);
+  groundMesh.rotation.x = -Math.PI / 2;
+  groundMesh.position.set(0, 0, -32);
+  scene.add(groundMesh);
+
+  // Starfield — parallax backdrop feature.
+  const starGeo = new THREE.BufferGeometry();
+  const N = 900, pos = new Float32Array(N * 3);
+  for (let i = 0; i < N; i++) {
+    pos[i*3]   = (Math.random() - 0.5) * 190;
+    pos[i*3+1] = 4 + Math.random() * 62;
+    pos[i*3+2] = -20 - Math.random() * 120;
+  }
+  starGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  stars = new THREE.Points(starGeo, new THREE.PointsMaterial({
+    color: 0xffffff, size: 0.22, sizeAttenuation: true,
+    transparent: true, opacity: 0, depthWrite: false,
+  }));
+  scene.add(stars);
+
+  // T-Rex sprite plane + soft shadow.
+  trexMesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(1, 1),
+    // Textures are inverted at crop time (see cropTexture), matching Chrome's
+    // own dark-mode canvas filter; no extra tint is needed.
+    new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false })
+  );
+  scene.add(trexMesh);
+
+  const shadowC = document.createElement('canvas');
+  shadowC.width = shadowC.height = 128;
+  const sg = shadowC.getContext('2d');
+  const rad = sg.createRadialGradient(64, 64, 4, 64, 64, 62);
+  rad.addColorStop(0, 'rgba(0,0,0,0.62)');
+  rad.addColorStop(1, 'rgba(0,0,0,0)');
+  sg.fillStyle = rad;
+  sg.fillRect(0, 0, 128, 128);
+  const shadowTex = new THREE.CanvasTexture(shadowC);
+  trexShadow = new THREE.Mesh(
+    new THREE.PlaneGeometry(2.6, 1.15),
+    new THREE.MeshBasicMaterial({ map: shadowTex, transparent: true, depthWrite: false })
+  );
+  trexShadow.rotation.x = -Math.PI / 2;
+  scene.add(trexShadow);
+
+  // Restart button shown on game over.
+  restartMesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(1, 1),
+    new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false })
+  );
+  restartMesh.visible = false;
+  scene.add(restartMesh);
+
+  // Speed streaks.
+  streakMat = new THREE.LineBasicMaterial({
+    color: 0xffffff, transparent: true, opacity: 0, depthWrite: false,
+  });
+  world.streaks = [];
+  for (let i = 0; i < 26; i++) {
+    const g = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(), new THREE.Vector3(),
+    ]);
+    const line = new THREE.Line(g, streakMat);
+    line.userData = { z: -4 - Math.random() * 44, y: 0.4 + Math.random() * 5 };
+    scene.add(line);
+    world.streaks.push(line);
+  }
+
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+}
+
+// ============================================================ fx
+const fx = {
+  particles: [],
+  sfxOn: true,
+  audio: null,
+  dust() {
+    for (let i = 0; i < 10; i++) {
+      this.particles.push({
+        x: 0, y: uForPx(2), z: zForX(TREX.xPos) + 0.35,
+        vx: (Math.random() - 0.5) * 2.2,
+        vy: 0.7 + Math.random() * 1.5,
+        vz: (Math.random() - 0.5) * 1.6,
+        life: 1, decay: 0.02 + Math.random() * 0.02, size: 0.1 + Math.random() * 0.1,
+      });
+    }
+  },
+  crash() {
+    for (let i = 0; i < 90; i++) {
+      const a = Math.random() * Math.PI * 2;
+      this.particles.push({
+        x: 0, y: uForPx(22), z: zForX(TREX.xPos) + 0.5,
+        vx: Math.cos(a) * (2 + Math.random() * 7),
+        vy: 1 + Math.random() * 7,
+        vz: Math.sin(a) * (2 + Math.random() * 7),
+        life: 1, decay: 0.008 + Math.random() * 0.012, size: 0.12 + Math.random() * 0.16,
+      });
+    }
+  },
+  sfx(kind) {
+    if (!this.sfxOn) return;
+    try {
+      this.audio = this.audio || new (window.AudioContext || window.webkitAudioContext)();
+      const ac = this.audio, t = ac.currentTime, o = ac.createOscillator(), g = ac.createGain();
+      o.connect(g); g.connect(ac.destination);
+      if (kind === 'jump') { o.type = 'square'; o.frequency.setValueAtTime(420, t); o.frequency.exponentialRampToValueAtTime(680, t + 0.09); g.gain.setValueAtTime(0.05, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.12); o.start(t); o.stop(t + 0.13); }
+      else if (kind === 'crash') { o.type = 'sawtooth'; o.frequency.setValueAtTime(240, t); o.frequency.exponentialRampToValueAtTime(48, t + 0.42); g.gain.setValueAtTime(0.10, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.45); o.start(t); o.stop(t + 0.46); }
+      else { o.type = 'sine'; o.frequency.setValueAtTime(880, t); g.gain.setValueAtTime(0.035, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.09); o.start(t); o.stop(t + 0.1); }
+    } catch {}
+  },
+};
+
+// ============================================================ HUD
+const el = {
+  dist: document.getElementById('dist'),
+  hi: document.getElementById('hi'),
+  msg: document.getElementById('msg'),
+  toast: document.getElementById('toast'),
+};
+let toastTimer = 0;
+function showMsg(h) { el.msg.innerHTML = h; el.msg.classList.add('show'); }
+function hideMsg() { el.msg.classList.remove('show'); }
+function toast(text) {
+  el.toast.textContent = text;
+  el.toast.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.toast.classList.remove('show'), 1100);
+}
+
+// ============================================================ 3D sync
+const texCache = new Map();
+function tex(key, sx, sy, w, h) {
+  if (!texCache.has(key)) texCache.set(key, cropTexture(sx, sy, w, h));
+  return texCache.get(key);
+}
+
+function syncTrex() {
+  const frames = ANIM[TREX.status].frames;
+  const f = TREX.status === 'crashed' ? 0 : TREX.currentFrame % frames.length;
+  const w = trexWidth(), h = trexHeight();
+  const key = `trex:${TREX.status}:${f}`;
+  if (!texCache.has(key)) {
+    // SPR.tRex is the hdpi table origin; divide by spriteScale to get the
+    // logical origin cropTexture expects, so the frame offset is added once.
+    texCache.set(key, cropTexture(SPR.tRex.x / spriteScale + frames[f],
+      SPR.tRex.y / spriteScale, w, h));
+  }
+  const mat = trexMesh.material;
+  if (mat.map !== texCache.get(key)) {
+    mat.map = texCache.get(key);
+    mat.needsUpdate = true;
+  }
+  const wu = uForPx(w), hu = uForPx(h);
+  trexMesh.scale.set(wu, hu, 1);
+  trexMesh.position.set(0, yForScreen(trexTop()) + hu / 2, zForX(TREX.xPos));
+  // Shadow shrinks and dims as the T-Rex rises.
+  const lift = (GROUND_Y - TREX.yPos);
+  const s = Math.max(0.35, 1 - lift / 190);
+  trexShadow.scale.set(s, s, 1);
+  trexShadow.material.opacity = Math.max(0.12, 0.55 - lift / 260);
+  trexShadow.position.set(0.1, 0.012, zForX(TREX.xPos) + 0.25);
+}
+
+function syncObstacles() {
+  const seen = new Set();
+  for (const o of state.obstacles) {
+    seen.add(o);
+    let m = obstacleMeshes.get(o);
+    if (!m) {
+      const sp = SPR[o.type.type];
+      const key = `obs:${o.type.type}:${o.currentFrame}`;
+      const t = tex(key,
+        sp.x / spriteScale + (o.currentFrame ? o.type.width : 0),
+        sp.y / spriteScale, o.width, o.height);
+      // Give obstacles real depth so they read as solid 3D forms rather than
+      // billboards. Cacti are square in section; the pterodactyl stays thin.
+      const wu = uForPx(o.width), hu = uForPx(o.height);
+      // Cacti get a chunky square section so the camera's yaw shows a lit side
+      // face; the pterodactyl is a thin card because it is a flying silhouette.
+      const depth = o.type.type === 'pterodactyl' ? wu * 0.10 : wu * 0.9;
+      const geo = new THREE.BoxGeometry(wu, hu, depth);
+      // Front face (+z) carries the sprite and ignores lighting so the art
+      // stays crisp; the other faces are solid, lit, and slightly brighter than
+      // the ground so the 3D body is legible.
+      const face = new THREE.MeshBasicMaterial({ map: t, transparent: true });
+      const body = new THREE.MeshStandardMaterial({
+        color: 0x8a8a8a, roughness: 0.9, metalness: 0,
+        transparent: true, alphaTest: 0.5,
+      });
+      // BoxGeometry material order: +x, -x, +y, -y, +z, -z
+      m = new THREE.Mesh(geo, [face, face, body, body, face, body]);
+      scene.add(m);
+      obstacleMeshes.set(o, m);
+    }
+    // o.yPos is the obstacle's BOTTOM edge in screen space (105 + 35 = 140 =
+    // the ground line), so the box centre sits half a height above it.
+    m.position.set(0, yForScreen(o.yPos) + uForPx(o.height) / 2,
+      zForX(o.xPos + o.width / 2));
+  }
+  for (const [o, m] of obstacleMeshes) {
+    if (!seen.has(o)) { scene.remove(m); m.geometry.dispose(); obstacleMeshes.delete(o); }
+  }
+}
+
+function syncClouds() {
+  const seen = new Set();
+  for (const c of state.clouds) {
+    seen.add(c);
+    let m = cloudMeshes.get(c);
+    if (!m) {
+      m = new THREE.Mesh(
+        new THREE.PlaneGeometry(uForPx(46), uForPx(14)),
+        new THREE.MeshBasicMaterial({
+          map: tex('cloud', SPR.backgroundEl.x / spriteScale, SPR.backgroundEl.y / spriteScale, 46, 14),
+          transparent: true, opacity: 0.5, depthWrite: false,
+        })
+      );
+      scene.add(m);
+      cloudMeshes.set(c, m);
+    }
+    m.position.set(0, yForScreen(c.yPos), zForX(c.xPos));
+  }
+  for (const [c, m] of cloudMeshes) {
+    if (!seen.has(c)) { scene.remove(m); cloudMeshes.delete(c); }
+  }
+}
+
+// ============================================================ render
+let shake = 0, nightT = 0, dayPhase = 0;
+
+function render(dtMs) {
+  const dt = Math.min(dtMs, 100) / 1000;
+
+  syncTrex();
+  syncObstacles();
+  syncClouds();
+
+  // Day/night cycle driven by distance; also tints the fog.
+  dayPhase = (state.distanceRan / 9000) % 1;
+  const nightness = (1 - Math.cos(dayPhase * Math.PI * 2)) * 0.5;  // 0 day .. 1 night
+  nightT += (nightness - nightT) * Math.min(1, dt * 2);
+  stars.material.opacity = nightT * 0.85;
+  stars.rotation.y += dt * 0.004;
+  world.key.intensity = 1.5 - nightT * 0.95;
+  world.rim.intensity = 0.5 + nightT * 0.5;
+  world.key.color.setHSL(0.08, 0.25 * (1 - nightT), 0.5 + 0.5 * (1 - nightT));
+  scene.fog.color.setRGB(0, 0, 0);
+
+  // Ground scroll.
+  groundTex.offset.x += (state.speed * dt) / 8;
+
+  // Speed streaks appear above ~9.
+  const fast = Math.max(0, (state.speed - 8.5) / 4.5);
+  streakMat.opacity = fast * 0.35;
+  for (const line of world.streaks) {
+    line.userData.z += state.speed * dt * 14;
+    if (line.userData.z > 8) line.userData.z = -60 - Math.random() * 20;
+    const p = line.geometry.attributes.position;
+    p.setXYZ(0, -2.4, line.userData.y, line.userData.z);
+    p.setXYZ(1, 2.4, line.userData.y, line.userData.z + 1.4);
+    p.needsUpdate = true;
+  }
+
+  // Particles.
+  updateParticles(dt);
+
+  // Crash sequence: shake + slow motion settle.
+  const since = performance.now() - state.crashAt;
+  if (state.crashed && since < 900) {
+    shake = Math.max(shake, 0.55 * (1 - since / 900));
+  } else {
+    shake *= Math.max(0, 1 - dt * 7);
+  }
+  const sx = (Math.random() - 0.5) * shake;
+  const sy = (Math.random() - 0.5) * shake;
+  camera.position.set(2.2 + sx, 2.45 + sy, 6.6);
+  camera.lookAt(0.55 + sx * 0.3, 1.15, -5.5);
+
+  // Restart button after the crash settles.
+  if (state.crashed && since > 550) {
+    if (!restartMesh.material.map) {
+      // The sheet's `restart` table entry points at the offline globe glyph in
+      // this build; the actual button artwork sits at source (218,132), 60x58
+      // in hdpi pixels. Coordinates are raw hdpi, so bypass the /spriteScale.
+      const t = new THREE.CanvasTexture((() => {
+        const c = document.createElement('canvas');
+        c.width = 60; c.height = 58;
+        const g = c.getContext('2d');
+        g.imageSmoothingEnabled = false;
+        g.drawImage(sheet, 218, 132, 60, 58, 0, 0, 60, 58);
+        // Same treatment as cropTexture: invert for the dark scene, then drop
+        // the page halo so the button is not a grey card.
+        const px = g.getImageData(0, 0, 60, 58);
+        const d = px.data;
+        for (let i = 0; i < d.length; i += 4) {
+          d[i] = 255 - d[i]; d[i + 1] = 255 - d[i + 1]; d[i + 2] = 255 - d[i + 2];
+        }
+        knockOutDarkHalo(px, 60, 58);
+        g.putImageData(px, 0, 0);
+        return c;
+      })());
+      t.magFilter = THREE.NearestFilter;
+      t.minFilter = THREE.NearestFilter;
+      t.generateMipmaps = false;
+      t.colorSpace = THREE.SRGBColorSpace;
+      restartMesh.material.map = t;
+      restartMesh.material.needsUpdate = true;
+      restartMesh.scale.set(uForPx(30), uForPx(29), 1);
+      restartMesh.position.set(-1.4, uForPx(70), zForX(50));
+    }
+    restartMesh.visible = true;
+  } else {
+    restartMesh.visible = false;
+  }
+
+  renderer.render(scene, camera);
+}
+
+const partGeo = new THREE.BufferGeometry();
+const MAXP = 400;
+partGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAXP * 3), 3));
+partGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(MAXP * 3), 3));
+partGeo.setDrawRange(0, 0);
+const partMat = new THREE.PointsMaterial({
+  size: 0.16, vertexColors: true, transparent: true, opacity: 0.95,
+  depthWrite: false, sizeAttenuation: true,
+});
+let partPoints = null;
+
+function updateParticles(dt) {
+  if (!partPoints) {
+    partPoints = new THREE.Points(partGeo, partMat);
+    scene.add(partPoints);
+  }
+  const arr = fx.particles;
+  for (let i = arr.length - 1; i >= 0; i--) {
+    const p = arr[i];
+    p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt;
+    p.vy -= 9 * dt;
+    p.life -= p.decay;
+    if (p.life <= 0 || p.y < -0.5) arr.splice(i, 1);
+  }
+  const pos = partGeo.attributes.position.array;
+  const col = partGeo.attributes.color.array;
+  const n = Math.min(arr.length, MAXP);
+  for (let i = 0; i < n; i++) {
+    const p = arr[i];
+    pos[i*3] = p.x; pos[i*3+1] = p.y; pos[i*3+2] = p.z;
+    const v = 0.55 + p.life * 0.45;
+    col[i*3] = v; col[i*3+1] = v; col[i*3+2] = v;
+  }
+  partGeo.attributes.position.needsUpdate = true;
+  partGeo.attributes.color.needsUpdate = true;
+  partGeo.setDrawRange(0, n);
+}
+
+// ============================================================ input
+addEventListener('keydown', e => {
+  const k = e.keyCode;
+  if (k === 80) {                                   // P — pause
+    if (!state.playing && !state.paused) return;
+    state.paused = !state.paused;
+    if (state.paused) showMsg('paused'); else hideMsg();
+    toast(state.paused ? 'paused' : 'resumed');
+    e.preventDefault();
+    return;
+  }
+  if (k === 77) {                                   // M — mute
+    fx.sfxOn = !fx.sfxOn;
+    toast(fx.sfxOn ? 'sound on' : 'sound off');
+    e.preventDefault();
+    return;
+  }
+  if (e.repeat) return;
+  if (k === 38 || k === 32) {
+    e.preventDefault();
+    if (state.crashed) { reset(); return; }
+    if (state.paused) return;
+    startJump(state.speed);
+  } else if (k === 40) {
+    e.preventDefault();
+    if (!state.playing || state.paused) return;
+    if (TREX.status === 'jumping') { TREX.speedDrop = true; TREX.jumpVelocity = 1; }
+    else setStatus('ducking');
+  } else if (k === 13) {
+    e.preventDefault();
+    if (state.crashed) reset();
+  }
+});
+addEventListener('keyup', e => {
+  if (e.keyCode === 38) endJump();
+  if (e.keyCode === 40 && TREX.status === 'ducking') setStatus('running');
+});
+document.getElementById('scene').addEventListener('pointerdown', () => {
+  if (state.crashed) reset();
+  else if (!state.paused) startJump(state.speed);
+});
+
+// ============================================================ boot
+sheet.onload = () => {
+  spriteScale = sheet.naturalWidth >= 2400 ? 2 : 1;
+  SPR = spriteScale === 2 ? SPR_HDPI : SPR_LDPI;
+  spriteReady = true;
+  texCache.clear();
+  buildScene();
+  clock = new THREE.Clock();
+  let last = performance.now();
+  let lastScore = -1;
+  let frame = 0;
+
+  function loop(now) {
+    const dtMs = now - last;
+    last = now;
+    update(Math.min(dtMs, 100));
+    render(dtMs);
+
+    // HUD
+    const dist = Math.floor(state.distanceRan * 0.025);
+    if (dist !== lastScore) {
+      el.dist.textContent = dist;
+      el.hi.textContent = Math.floor(highScore * 0.025);
+      if (lastScore >= 0 && dist > 0 && dist % 100 === 0) fx.sfx('score');
+      lastScore = dist;
+    }
+    frame++;
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+};
+// Inlined as a data URI: a file:// <img> taints the canvas it is drawn
+// into, so CanvasTexture upload fails and every sprite renders blank.
+sheet.src = 'data:image/png;base64,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';
+</script>
+</body>
+</html>
